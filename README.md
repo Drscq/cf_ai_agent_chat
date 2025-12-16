@@ -19,6 +19,12 @@ A real-time conversational AI application built on Cloudflare Workers, demonstra
 - **🎨 Premium Dark UI** — Modern chat interface with animations and gradient styling
 - **📦 Single-File Deploy** — Entire app in one TypeScript file
 
+## 💬 Use Case
+
+Here's the chat interface in action, asking about Cloudflare's research internship:
+
+![Cloudflare Agent Chat Demo](assets/use_case_screenshot.png)
+
 ## 🏗️ Architecture
 
 ```
