@@ -1,36 +1,49 @@
-import { Agent, routeAgentRequest } from "agents";
-
 export interface Env {
-    AI: any;
+    AI: Ai;
     ChatAgent: DurableObjectNamespace;
 }
 
-export class ChatAgent extends Agent<Env> {
-    async ensureTable() {
-        await this.sql`
-      CREATE TABLE IF NOT EXISTS history (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        role TEXT,
-        content TEXT,
-        timestamp INTEGER
-      )
-    `;
+// Using a simpler Durable Object pattern instead of the agents SDK
+export class ChatAgent implements DurableObject {
+    private sql: SqlStorage;
+    private env: Env;
+
+    constructor(state: DurableObjectState, env: Env) {
+        this.sql = state.storage.sql;
+        this.env = env;
+        this.ensureTable();
     }
 
-    async getHistory() {
-        await this.ensureTable();
-        const result = await this.sql`SELECT role, content FROM history ORDER BY timestamp ASC`;
+    private ensureTable() {
+        this.sql.exec(`
+            CREATE TABLE IF NOT EXISTS history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                role TEXT,
+                content TEXT,
+                timestamp INTEGER
+            )
+        `);
+    }
+
+    private getHistory(): { role: string; content: string }[] {
+        const result = this.sql.exec("SELECT role, content FROM history ORDER BY timestamp ASC");
         return Array.from(result) as { role: string; content: string }[];
     }
 
-    async chat(message: string) {
-        await this.ensureTable();
-        await this.sql`INSERT INTO history (role, content, timestamp) VALUES (${"user"}, ${message}, ${Date.now()})`;
+    async chat(message: string): Promise<string> {
+        // Save user message
+        this.sql.exec(
+            "INSERT INTO history (role, content, timestamp) VALUES (?, ?, ?)",
+            "user", message, Date.now()
+        );
 
-        const history = await this.getHistory();
+        const history = this.getHistory();
         const messages = history.map((h) => ({ role: h.role, content: h.content }));
 
-        const systemMessage = { role: "system", content: "You are a helpful assistant powered by Cloudflare Agents and Llama 3.3. You are concise and friendly." };
+        const systemMessage = {
+            role: "system",
+            content: "You are a helpful assistant powered by Cloudflare Agents and Llama 3.3. You are concise and friendly."
+        };
         const context = [systemMessage, ...messages];
 
         let reply = "Error generating response.";
@@ -38,15 +51,38 @@ export class ChatAgent extends Agent<Env> {
             const response = await this.env.AI.run("@cf/meta/llama-3.3-70b-instruct-fp8-fast", {
                 messages: context
             });
-            // @ts-ignore
-            reply = response.response || (response as any).result?.response || JSON.stringify(response);
+            reply = (response as any).response || JSON.stringify(response);
         } catch (e) {
-            reply = "Error: " + e;
+            reply = "Error: " + String(e);
         }
 
-        await this.sql`INSERT INTO history (role, content, timestamp) VALUES (${"assistant"}, ${reply}, ${Date.now()})`;
+        // Save assistant message
+        this.sql.exec(
+            "INSERT INTO history (role, content, timestamp) VALUES (?, ?, ?)",
+            "assistant", reply, Date.now()
+        );
 
         return reply;
+    }
+
+    async fetch(request: Request): Promise<Response> {
+        if (request.method !== "POST") {
+            return new Response("Method not allowed", { status: 405 });
+        }
+
+        try {
+            const body = await request.json() as string[];
+            const message = Array.isArray(body) ? body[0] : String(body);
+            const reply = await this.chat(message);
+            return new Response(JSON.stringify(reply), {
+                headers: { "Content-Type": "application/json" }
+            });
+        } catch (e) {
+            return new Response(JSON.stringify({ error: String(e) }), {
+                status: 500,
+                headers: { "Content-Type": "application/json" }
+            });
+        }
     }
 }
 
@@ -165,9 +201,7 @@ const HTML = `
         const form = document.getElementById('input-area');
         const input = document.getElementById('message-input');
         
-        // This relies on RPC routing provided by 'agents' SDK via Worker
-        // Assuming default routing: /<Namespace>/<Name>/<Method>
-        const AGENT_ENDPOINT = "/ChatAgent/default/chat";
+        const AGENT_ENDPOINT = "/api/chat";
 
         function addMessage(role, text) {
             const div = document.createElement('div');
@@ -186,7 +220,6 @@ const HTML = `
             input.value = '';
 
             try {
-                // The Agents SDK typically expects an array of args
                 const response = await fetch(AGENT_ENDPOINT, {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
@@ -196,10 +229,7 @@ const HTML = `
                 if (!response.ok) throw new Error("Network error: " + response.statusText);
                 
                 const data = await response.json();
-                // Response might be the direct result or wrapped
-                const reply = data; 
-                
-                addMessage('assistant', reply);
+                addMessage('assistant', data);
             } catch (err) {
                 addMessage('assistant', "Error: " + err.message);
             }
@@ -210,14 +240,37 @@ const HTML = `
 `;
 
 export default {
-    async fetch(request: Request, env: Env, ctx: ExecutionContext) {
+    async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
         const url = new URL(request.url);
+
+        // Serve the HTML frontend
         if (url.pathname === "/" || url.pathname === "/index.html") {
             return new Response(HTML, { headers: { "Content-Type": "text/html" } });
         }
 
-        // Fallback to Agent routing
-        // This will handle /ChatAgent/default/chat
-        return routeAgentRequest(request, env);
+        // Handle favicon requests
+        if (url.pathname === "/favicon.ico") {
+            return new Response(null, { status: 204 });
+        }
+
+        // Handle chat API endpoint
+        if (url.pathname === "/api/chat" && request.method === "POST") {
+            try {
+                // Get or create a Durable Object instance
+                const id = env.ChatAgent.idFromName("default");
+                const stub = env.ChatAgent.get(id);
+
+                // Forward request to Durable Object
+                return stub.fetch(request);
+            } catch (e) {
+                return new Response(JSON.stringify({ error: String(e) }), {
+                    status: 500,
+                    headers: { "Content-Type": "application/json" }
+                });
+            }
+        }
+
+        // Fallback 404
+        return new Response("Not Found", { status: 404 });
     }
 };
